@@ -6034,9 +6034,9 @@ function scheduleNoteAt(freq, atTime, dur, vol, preset, loopId){
 function scheduleAhead(){
   if(!bgmActive) return;
   const a = audioCtx; if(!a) return;
+  // suspended でも resume を促しつつ予約は進める (Web Audio はキューに溜め、resume 後に再生)
   if(a.state === 'suspended'){
     a.resume().catch(()=>{});
-    return; // 次の tick で再試行
   }
   const myLoopId = bgmLoopId;
   const now = a.currentTime;
@@ -6074,7 +6074,7 @@ function bgmTick(){
   const a = audioCtx; if(!a) return;
   if(a.state === 'suspended'){
     a.resume().catch(()=>{});
-    return;
+    // suspended のままでも予約は進めて、resume 後にそのまま鳴るようにする
   }
   // 無音検出: 最後にスケジュール済みの時刻が現在より 0.3秒以下なら強制補充
   if(_bgmLastScheduled - a.currentTime < 0.3){
@@ -6122,15 +6122,13 @@ function startBgm(type){
   bgmActive = true;
   bgmType = type;
   startHeartbeat();
-  // resume を待ってから演奏開始 — 「最初から流れない」を解消
+  // resume を待たずに即座にループ開始 (Web Audio は suspended でも未来時刻の予約を保持する)。
+  // 並行して resume を呼び、resume 完了後にもう一度 playBgmLoop で先頭から鳴らし直す保険を張る。
+  playBgmLoop(type);
   if(a && a.state === 'suspended'){
     a.resume().then(()=>{
       if(bgmActive && bgmType === type) playBgmLoop(type);
-    }).catch(()=>{
-      if(bgmActive && bgmType === type) playBgmLoop(type);
-    });
-  } else {
-    playBgmLoop(type);
+    }).catch(()=>{});
   }
 }
 // 楽曲切替: 5連目などでトラック変更時、現在のループID を進めて再構築
