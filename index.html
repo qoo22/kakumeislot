@@ -4762,44 +4762,100 @@ async function runBattle(playerWins, mode, reachTier){
   reachSfx();
   await sleep(900);
 
-  // Comeback flag: when player wins, sometimes start losing then turn around
-  const isComeback = playerWins && Math.random() < 0.28;
-  const comebackTurn = isComeback ? 2 : -1; // awakening on 3rd turn
+  // Number of rounds: super has the most spectacle
+  const turns = isSuper ? 6 : (isKakuhen ? 5 : 4);
+
+  // Comeback flag: when player wins, sometimes start losing then turn around.
+  // 覚醒タイミングはランダム (1〜turns-2 ターン目) で「いつ覚醒するか」も予想不能に。
+  const isComeback = playerWins && Math.random() < 0.30;
+  const comebackTurn = isComeback ? 1 + Math.floor(Math.random() * Math.max(1, turns-2)) : -1;
   let awakened = false;
   if(isComeback) R.comebacks++;
 
-  // Number of rounds: super has the most spectacle
-  const turns = isSuper ? 6 : (isKakuhen ? 5 : 4);
+  // === ダメージ配分の事前計算 ===
+  // 各ターンの相対ウェイト (0.5〜1.7、30%でクリティカル 1.5〜3x)。
+  // 合計を予算に正規化することで「合計はWIN/LOSE要件を満たす」「個々のターンは大きく揺らぐ」配分にする。
+  function planWeights(n){
+    const w = [];
+    for(let i=0;i<n;i++){
+      let v = 0.5 + Math.random()*1.2;
+      if(Math.random() < 0.30) v *= 1.5 + Math.random()*1.5; // クリティカル
+      w.push(v);
+    }
+    return w;
+  }
+  function normalize(weights, target){
+    const sum = weights.reduce((a,b)=>a+b, 0) || 1;
+    return weights.map(w => (w/sum) * target);
+  }
+  // Hero/Foe の合計ダメージ予算: 勝者は相手最大HPを超え、敗者は相手最大HP未満。
+  const heroBudget = playerWins
+    ? foeMaxHp * (1.05 + Math.random()*0.30)        // 勝てる量 (相手HPの 105〜135%)
+    : foeMaxHp * (0.30 + Math.random()*0.40);       // 削るが倒せない (30〜70%)
+  const foeBudget = playerWins
+    ? heroMaxHp * (0.35 + Math.random()*0.40)       // 削るが倒せない (35〜75%)
+    : heroMaxHp * (1.05 + Math.random()*0.30);      // 勝てる量
+  let heroDmgs = normalize(planWeights(turns), heroBudget);
+  let foeDmgs  = normalize(planWeights(turns), foeBudget);
+
+  // どのターンが「決定打 (相手HPを0にする一撃)」になるかを事前計算 → そのターンを ult アニメ化。
+  function findKillTurn(dmgs, victimMaxHp){
+    let acc = 0;
+    for(let i=0;i<dmgs.length;i++){
+      acc += dmgs[i];
+      if(acc >= victimMaxHp) return i;
+    }
+    return dmgs.length - 1;
+  }
+  let heroKillTurn = playerWins  ? findKillTurn(heroDmgs, foeMaxHp)  : -1;
+  let foeKillTurn  = !playerWins ? findKillTurn(foeDmgs,  heroMaxHp) : -1;
+
+  // 「コンボ (大ダメージ・但し決定打ではない)」の判定: 自軍ダメージの上位30%水準を超えるターン。
+  function bigHitThreshold(dmgs, killTurnIdx){
+    const others = dmgs.filter((_,i) => i !== killTurnIdx).slice().sort((a,b)=>b-a);
+    if(!others.length) return Infinity;
+    const idx = Math.max(0, Math.floor(others.length*0.30) - 1);
+    return others[idx];
+  }
+  let heroBigThreshold = bigHitThreshold(heroDmgs, heroKillTurn);
+
   for(let t=0;t<turns;t++){
-    // Trigger comeback cut-in mid-battle
+    // 覚醒カットイン: 残ターンの hero ダメージを 1.5〜2.3 倍、foe ダメージを 0.3〜0.6 倍に再編
     if(isComeback && t === comebackTurn && !awakened){
       awakened = true;
       await playComebackCutIn(hero, isKakuhen||isSuper);
-      // Heal hero partially & buff
       heroHp = Math.min(heroMaxHp, heroHp + heroMaxHp*0.5);
       hpHero.style.width = (heroHp/heroMaxHp*100)+'%';
       hpHero.classList.remove('low');
       flashScreen();
+      const boost  = 1.5 + Math.random()*0.8;
+      const reduce = 0.3 + Math.random()*0.3;
+      for(let k=t;k<turns;k++){
+        heroDmgs[k] *= boost;
+        foeDmgs[k]  *= reduce;
+      }
+      // 覚醒後は決定打位置・コンボ閾値を再計算
+      heroKillTurn = findKillTurn(heroDmgs, foeMaxHp);
+      heroBigThreshold = bigHitThreshold(heroDmgs, heroKillTurn);
     }
-    // Hero attack
-    const isUlt = playerWins && t === turns-1; // final blow on win
-    // Mid-battle big move
-    const isCombo = playerWins && t === turns-2 && (isKakuhen || isSuper);
-    const isMagic = !isUlt && !isCombo && (t === 1 || ((isKakuhen||isSuper) && t===2));
+
+    // === Hero attack ===
+    let heroDmg = heroDmgs[t];
+    // 覚醒前のカムバック中はヘロヘロ (大幅減衰)
+    if(isComeback && !awakened) heroDmg *= 0.20 + Math.random()*0.15;
+
+    const isUlt = playerWins && t === heroKillTurn;
+    if(isUlt) heroDmg = fHp + 50; // 決定打は確実に倒し切る
+    const isCombo = !isUlt && heroDmg >= heroBigThreshold && heroDmg > 24;
+    const isMagic = !isUlt && !isCombo && Math.random() < 0.45;
     const type = isUlt ? 'ult' : (isCombo ? 'combo' : (isMagic ? 'magic' : 'slash'));
+
     const ultNames = isSuper
       ? ['超神撃 オ メ ガ', '宇宙崩壊 ビ ッ グ バ ン', '全知全能 ジ ャ ッ ジ メ ン ト', '神 罰 ア ポ カ リ プ ス']
       : isKakuhen
         ? ['神 撃 斬', '魔 滅 砲', '天 罰 オ メ ガ', '光 輪 殲 滅']
         : ['真 空 斬', '螺 旋 突', '雷 鳴 剣', '裂 帝 拳'];
     const ultName = ultNames[Math.floor(Math.random()*ultNames.length)];
-    // Hero damage: comeback = weak before awakening, strong after
-    const heroDmg = isUlt
-      ? 999
-      : isCombo ? 60 + Math.random()*30
-      : isComeback && !awakened ? 5 + Math.random()*6
-      : isComeback && awakened   ? 38 + Math.random()*24
-      : (playerWins ? 22 + Math.random()*16 : 8 + Math.random()*8);
     const log = isUlt
       ? '★必殺技『'+ultName+'』発動★'
       : isCombo ? '☆コンボ連撃☆'
@@ -4814,7 +4870,6 @@ async function runBattle(playerWins, mode, reachTier){
       ultName,
       color: isSuper ? '#aa00ff' : (isKakuhen ? '#ff00ff' : '#ffaa00'),
     });
-    // Combo = multiple slashes
     if(isCombo){
       for(let k=0;k<3;k++){
         await sleep(120);
@@ -4832,16 +4887,15 @@ async function runBattle(playerWins, mode, reachTier){
 
     if(fHp<=0) break;
 
-    // Foe attack
-    const foeUlt = !playerWins && t === turns-1;
+    // === Foe attack ===
+    let foeDmg = foeDmgs[t];
+    if(isComeback && awakened) foeDmg *= 0.3;
+
+    const foeUlt = !playerWins && t === foeKillTurn;
+    if(foeUlt) foeDmg = heroHp + 50;
     const ftype = foeUlt ? 'ult' : (Math.random()<0.4?'magic':'slash');
     const fUltNames = ['冥 界 業 火', '邪 神 召 喚', '絶 望 闇 撃'];
     const fUlt = fUltNames[Math.floor(Math.random()*fUltNames.length)];
-    const foeDmg = foeUlt
-      ? 999
-      : isComeback && !awakened ? 18 + Math.random()*10
-      : isComeback && awakened   ? 3 + Math.random()*4
-      : (playerWins ? 6 + Math.random()*8 : 22 + Math.random()*14);
     const flog = foeUlt
       ? '☠'+foe.name+'の必殺『'+fUlt+'』！'
       : '反撃！';
@@ -4855,8 +4909,8 @@ async function runBattle(playerWins, mode, reachTier){
       color: '#ff0040',
     });
     heroHp = Math.max(0, heroHp - foeDmg);
-    // Safety: during comeback pre-awakening, keep hero on 1hp (clinging to life)
-    if(isComeback && !awakened && heroHp <= 0){ heroHp = 1; }
+    // Safety: 勝者側 (playerWins) が事故死しないよう 1HP で踏みとどまる
+    if(playerWins && heroHp <= 0){ heroHp = 1; }
     hpHero.style.width = (heroHp/heroMaxHp*100) + '%';
     if(heroHp/heroMaxHp < 0.3) hpHero.classList.add('low');
     spawnDamageNumber(heroEl, Math.round(foeDmg), foeUlt);
